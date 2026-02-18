@@ -276,6 +276,30 @@ void motor_can_get_debug_info(uint32_t *tx_count, uint32_t *error_flags);
  */
 void motor_can_clear_error_flags(void);
 
+/* ========== 超时检测 ========== */
+
+/**
+ * @brief 电机通信超时检测
+ * @return 超时的电机ID (0-5), -1=无超时
+ * @note 在主循环中定期调用 (建议每100ms)
+ *       超时阈值: 500ms无响应视为失联
+ */
+int motor_can_check_timeout(void);
+
+/**
+ * @brief 获取电机最后通信时间
+ * @param joint_id 关节ID (0-5)
+ * @return 最后收到响应的时间戳 (ms)
+ */
+uint32_t motor_can_get_last_rx_time(uint8_t joint_id);
+
+/**
+ * @brief 重置电机通信超时计时器
+ * @param joint_id 关节ID (0-5), 0xFF=所有电机
+ * @note 在电机使能或系统初始化后调用
+ */
+void motor_can_reset_timeout(uint8_t joint_id);
+
 #ifdef __cplusplus
 }
 #endif

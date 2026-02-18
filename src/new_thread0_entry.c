@@ -10,12 +10,15 @@
 #include "gripper.h"
 #include "watchdog.h"
 #include "zdt_test.h"
+#include "realtime_monitor.h"
+#include "task_monitor.h"
+#include "degradation.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 /* ========== 看门狗配置 ========== */
-#define WATCHDOG_ENABLED    0   /* 1=启用看门狗, 0=禁用(调试时) */
+#define WATCHDOG_ENABLED    1   /* 1=启用看门狗, 0=禁用(调试时) */
 
 #define LED_PIN BSP_IO_PORT_04_PIN_00
 
@@ -31,7 +34,7 @@ static bool g_executing_sequence = false;  /* 是否正在执行动作序列 */
 static bool g_collision_detected = false;  /* 碰撞检测标志 */
 
 /* ========== 碰撞检测配置 ========== */
-#define COLLISION_CONFIRM_COUNT  3   /* 连续检测次数阈值 (3次 x 20ms = 60ms) */
+#define COLLISION_CONFIRM_COUNT  2   /* 连续检测次数阈值 (2次 x 10ms = 20ms) */
 static uint8_t g_stall_count[6] = {0};  /* 每个电机的连续堵转计数 */
 
 /* ========== 硬件定时器运动控制 ========== */
@@ -44,6 +47,7 @@ static volatile bool g_motion_tick = false;  /* 5ms定时器触发标志 */
 void motion_timer_callback(timer_callback_args_t *p_args)
 {
     if (TIMER_EVENT_CYCLE_END == p_args->event) {
+        rtmon_tick();  /* Record timestamp for jitter monitoring */
         g_motion_tick = true;
     }
 }
@@ -221,6 +225,30 @@ static bool handle_test_command(const char *cmd)
     if (strncmp(cmd, "nettest", 7) == 0) {
         debug_println("[CMD] Running network connectivity test...");
         w800_test_network();
+        return true;
+    }
+
+    /* 实时性监测命令: rtmon [reset] */
+    if (strncmp(cmd, "rtmon", 5) == 0) {
+        if (strstr(cmd, "reset") != NULL) {
+            rtmon_reset();
+            rtmon_wcet_reset();
+            debug_println("[RTMON] Statistics reset.");
+        } else {
+            rtmon_print_report();
+        }
+        return true;
+    }
+
+    /* 任务监控命令: taskmon [reset] */
+    if (strncmp(cmd, "taskmon", 7) == 0) {
+        if (strstr(cmd, "reset") != NULL) {
+            taskmon_reset();
+            debug_println("[TASKMON] Statistics reset.");
+        } else {
+            taskmon_update();  /* 先更新统计 */
+            taskmon_print_report();
+        }
         return true;
     }
 
@@ -430,14 +458,45 @@ static bool handle_test_command(const char *cmd)
 
     /* 清除堵转保护: clear */
     if (strncmp(cmd, "clear", 5) == 0) {
-        debug_println("[CLEAR] Clearing stall protection...");
-        motor_can_clear_stall(0xFF);
-        g_collision_detected = false;  /* 重置碰撞检测标志 */
-        /* 重置堵转计数器 */
+        debug_println("[CLEAR] Clearing stall protection and degradation...");
+        degradation_clear();  /* Use degradation module to clear all faults */
+        g_collision_detected = false;  /* Reset collision flag */
+        /* Reset stall counters */
         for (int i = 0; i < 6; i++) {
             g_stall_count[i] = 0;
         }
-        debug_println("[CLEAR] Done! Collision flag and counters reset.");
+        debug_println("[CLEAR] Done! All faults cleared.");
+        return true;
+    }
+
+    /* Degradation status command: degrade */
+    if (strncmp(cmd, "degrade", 7) == 0) {
+        degradation_status_t status;
+        degradation_get_status(&status);
+        debug_println("[DEGRADE] Status:");
+        debug_print("  Level: ");
+        debug_println(degradation_level_str(status.level));
+        debug_print("  Last fault: ");
+        debug_println(degradation_fault_str(status.last_fault));
+        debug_print("  Fault joint: ");
+        if (status.fault_joint < 6) {
+            debug_print_int(status.fault_joint);
+        } else {
+            debug_print("N/A");
+        }
+        debug_println("");
+        debug_print("  Speed scale: ");
+        debug_print_int((int)(status.speed_scale * 100));
+        debug_println("%");
+        debug_print("  Disabled joints: 0x");
+        char hex[3];
+        hex[0] = "0123456789ABCDEF"[(status.disabled_joints >> 4) & 0x0F];
+        hex[1] = "0123456789ABCDEF"[status.disabled_joints & 0x0F];
+        hex[2] = '\0';
+        debug_println(hex);
+        debug_print("  Consecutive failures: ");
+        debug_print_int(status.consecutive_failures);
+        debug_println("");
         return true;
     }
 
@@ -503,6 +562,8 @@ static bool handle_test_command(const char *cmd)
 
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
+            /* 重置超时计时器 */
+            motor_can_reset_timeout(0xFF);
             debug_println("[CAN] Done");
         }
         else if (strncmp(sub, "disable", 7) == 0) {
@@ -974,6 +1035,19 @@ void new_thread0_entry(void * pvParameters)
     motion_init();
     debug_println("[DBG] motion_init done");
 
+    /* 初始化降级策略模块 */
+    degradation_init();
+    debug_println("[DEGRADE] Degradation module initialized");
+
+    /* 初始化实时性监测 (DWT cycle counter) */
+    rtmon_init();
+    debug_println("[RTMON] Real-time monitor initialized");
+
+    /* 初始化任务监控 */
+    taskmon_init();
+    taskmon_register(NULL, "main_thread");  /* 注册主线程 */
+    debug_println("[TASKMON] Task monitor initialized");
+
     debug_println("[DBG] GPT open...");
     /* 启动运动控制定时器 (5ms周期, 200Hz) */
     R_GPT_Open(&g_timer0_ctrl, &g_timer0_cfg);
@@ -1085,6 +1159,13 @@ void new_thread0_entry(void * pvParameters)
             debug_println("  grip close    - Close gripper");
             debug_println("  grip vacuum on/off");
             debug_println("");
+            debug_println("  === Diagnostics ===");
+            debug_println("  rtmon         - Show real-time stats");
+            debug_println("  rtmon reset   - Reset statistics");
+            debug_println("  taskmon       - Show task CPU usage");
+            debug_println("  taskmon reset - Reset task stats");
+            debug_println("  degrade       - Show degradation status");
+            debug_println("");
             debug_println("  <text>        - Send to LLM");
             debug_println("");
             debug_print("> ");
@@ -1094,6 +1175,8 @@ void new_thread0_entry(void * pvParameters)
     char cmd_buf[256];
     uint32_t heartbeat_counter = 0;
     uint32_t collision_check_counter = 0;
+    uint32_t taskmon_counter = 0;  /* 任务监控更新计数器 */
+    TickType_t xLastWakeTime = xTaskGetTickCount();
 
     while (1)
     {
@@ -1124,42 +1207,85 @@ void new_thread0_entry(void * pvParameters)
 
             motion_state_t mstate = motion_get_state();
             if (mstate == MOTION_EXECUTING) {
+                rtmon_wcet_start();
                 motion_update();
+                rtmon_wcet_end("motion");
             }
             /* 运动完成，继续执行下一个动作 */
             if (g_executing_sequence && mstate == MOTION_DONE) {
                 execute_next_action();
             }
 
-            /* 碰撞检测 (20ms周期，每4个tick检测一次) */
+            /* 碰撞检测 (10ms周期，每2个tick检测一次) */
             collision_check_counter++;
-            if (collision_check_counter >= 4 && !g_collision_detected) {
+            if (collision_check_counter >= 2 && !g_collision_detected) {
                 collision_check_counter = 0;
+
+                /* CAN超时检测 (电机失联) */
+                int timeout_motor = motor_can_check_timeout();
+                if (timeout_motor >= 0) {
+                    /* Use degradation strategy instead of immediate emergency stop */
+                    degrade_level_t level = degradation_handle_fault(
+                        FAULT_CAN_TIMEOUT, (uint8_t)timeout_motor);
+
+                    if (level == DEGRADE_EMERGENCY) {
+                        g_collision_detected = true;
+                        g_executing_sequence = false;
+                    } else if (level == DEGRADE_SINGLE_JOINT) {
+                        /* Continue with degraded operation */
+                        debug_print("[DEGRADE] Continuing without J");
+                        debug_print_int(timeout_motor);
+                        debug_println("");
+                    }
+                    debug_print("> ");
+                }
+
                 /* 检查所有电机的堵转状态 */
                 for (int i = 0; i < 6; i++) {
+                    /* Skip disabled joints */
+                    if (degradation_is_joint_disabled((uint8_t)i)) {
+                        continue;
+                    }
+
                     if (motor_can_get_stall_status((uint8_t)i) == 1) {
                         /* 堵转计数+1 */
                         g_stall_count[i]++;
 
-                        /* 连续检测到堵转超过阈值才触发急停 */
+                        /* 连续检测到堵转超过阈值才触发 */
                         if (g_stall_count[i] >= COLLISION_CONFIRM_COUNT) {
-                            g_collision_detected = true;
-                            motor_can_emergency_stop();
-                            motion_stop();
-                            g_executing_sequence = false;
-                            debug_println("");
-                            debug_print("[COLLISION] Motor J");
-                            debug_print_int(i);
-                            debug_print(" stall confirmed (");
-                            debug_print_int(g_stall_count[i]);
-                            debug_println(" times)! Emergency stop.");
-                            debug_println("[COLLISION] Use 'clear' to reset and continue.");
-                            debug_print("> ");
+                            /* Use degradation strategy */
+                            degrade_level_t level = degradation_handle_fault(
+                                FAULT_MOTOR_STALL, (uint8_t)i);
+
+                            if (level >= DEGRADE_POSITION_HOLD) {
+                                g_collision_detected = true;
+                                g_executing_sequence = false;
+                                debug_println("");
+                                debug_print("[COLLISION] Motor J");
+                                debug_print_int(i);
+                                debug_print(" stall -> ");
+                                debug_println(degradation_level_str(level));
+                                debug_println("[COLLISION] Use 'clear' to reset.");
+                                debug_print("> ");
+                            }
                             break;
                         }
                     } else {
                         /* 堵转状态消失，重置计数 */
                         g_stall_count[i] = 0;
+                    }
+                }
+
+                /* Attempt auto-recovery if in degraded state */
+                if (degradation_get_level() > DEGRADE_NONE &&
+                    degradation_get_level() < DEGRADE_EMERGENCY) {
+                    if (degradation_recover()) {
+                        debug_print("[DEGRADE] Auto-recovered to ");
+                        debug_println(degradation_level_str(degradation_get_level()));
+                        if (degradation_get_level() == DEGRADE_NONE) {
+                            g_collision_detected = false;
+                        }
+                        debug_print("> ");
                     }
                 }
             }
@@ -1172,6 +1298,13 @@ void new_thread0_entry(void * pvParameters)
                 /* 喂狗 (每500ms刷新一次，超时约2.7秒) */
                 watchdog_refresh();
 
+                /* 任务监控更新 (每秒一次) */
+                taskmon_counter++;
+                if (taskmon_counter >= 2) {  /* 500ms * 2 = 1s */
+                    taskmon_counter = 0;
+                    taskmon_update();
+                }
+
                 if (g_wifi_error_code != 0) {
                     R_IOPORT_PinWrite(&g_ioport_ctrl, LED_PIN, BSP_IO_LEVEL_HIGH);
                 } else {
@@ -1183,6 +1316,6 @@ void new_thread0_entry(void * pvParameters)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1));  /* 1ms轮询，让出CPU给其他任务 */
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1));  /* 1ms绝对延迟，保证固定周期 */
     }
 }

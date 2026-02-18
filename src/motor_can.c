@@ -60,6 +60,11 @@ static volatile uint8_t g_tx_pending = 0;  /* 待发送完成的帧数 */
 static volatile uint32_t g_tx_complete_count = 0;  /* TX完成计数 */
 static volatile uint32_t g_can_error_flags = 0;    /* CAN错误标志 */
 
+/* ========== 超时检测 ========== */
+#define MOTOR_TIMEOUT_MS    200     /* 电机通信超时阈值 (ms) */
+static volatile uint32_t g_last_rx_time[MOTOR_CAN_NUM_JOINTS] = {0};  /* 最后接收时间 */
+static volatile bool g_timeout_enabled = false;    /* 超时检测使能 */
+
 /* ========== 参数配置状态机 (Read-Modify-Write) ========== */
 typedef enum {
     PARAM_STATE_IDLE = 0,
@@ -453,6 +458,9 @@ void motor_can_rx_callback(uint32_t can_id, const uint8_t *data, uint8_t len)
 
     uint8_t joint_id = addr - g_config.base_addr;
     uint8_t cmd = data[0];
+
+    /* 更新最后接收时间 (超时检测用) */
+    g_last_rx_time[joint_id] = xTaskGetTickCount();
 
     /* 处理到位返回 (Emm: 0xFD + 0x9F = 到位) */
     if (cmd == CMD_POSITION_EMM && len >= 2) {
@@ -1146,5 +1154,50 @@ void canfd_callback(can_callback_args_t * p_args)
         case CAN_EVENT_TX_FIFO_EMPTY:
         default:
             break;
+    }
+}
+
+/* ========== 超时检测实现 ========== */
+
+int motor_can_check_timeout(void)
+{
+    if (!g_timeout_enabled || !g_initialized) {
+        return -1;
+    }
+
+    uint32_t now = xTaskGetTickCount();
+
+    for (uint8_t i = 0; i < MOTOR_CAN_NUM_JOINTS; i++) {
+        uint32_t elapsed = now - g_last_rx_time[i];
+        if (elapsed > pdMS_TO_TICKS(MOTOR_TIMEOUT_MS)) {
+            /* 电机i超时 */
+            return (int)i;
+        }
+    }
+
+    return -1;  /* 无超时 */
+}
+
+uint32_t motor_can_get_last_rx_time(uint8_t joint_id)
+{
+    if (joint_id >= MOTOR_CAN_NUM_JOINTS) {
+        return 0;
+    }
+    return g_last_rx_time[joint_id];
+}
+
+void motor_can_reset_timeout(uint8_t joint_id)
+{
+    uint32_t now = xTaskGetTickCount();
+
+    if (joint_id == 0xFF) {
+        /* 重置所有电机 */
+        for (uint8_t i = 0; i < MOTOR_CAN_NUM_JOINTS; i++) {
+            g_last_rx_time[i] = now;
+        }
+        g_timeout_enabled = true;
+    } else if (joint_id < MOTOR_CAN_NUM_JOINTS) {
+        g_last_rx_time[joint_id] = now;
+        g_timeout_enabled = true;
     }
 }

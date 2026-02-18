@@ -135,8 +135,8 @@ void motion_init(void)
     kin_solver_init(&g_ik_solver, DEFAULT_LIMITS);
 
     debug_println("[MOTION] init step 2...");
-    /* 初始化轨迹规划器 (10ms周期) */
-    traj_init(&g_planner, 10);
+    /* 初始化轨迹规划器 (5ms周期，与GPT0定时器一致) */
+    traj_init(&g_planner, 5);
 
     debug_println("[MOTION] init step 3...");
     /* 设置速度/加速度限制 */
